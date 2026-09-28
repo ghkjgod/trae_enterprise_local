@@ -1,0 +1,27 @@
+Upstream licensing notice / 上游许可声明
+======================================
+
+Source: ZedeX/trae-local-api
+https://github.com/ZedeX/trae-local-api
+Baseline: f394031edf48b22c73901380d42a78ce2d00a67e
+
+The upstream README's "许可证" section states exactly:
+
+本项目仅供学习和研究使用。
+
+English translation (informative only):
+This project is for learning and research use only.
+
+At the referenced baseline, no standalone LICENSE, COPYING, or NOTICE file,
+SPDX license identifier, or standard open-source license grant was found.
+This repository preserves that upstream notice. It does not represent the
+upstream work as MIT, Apache-2.0, GPL, or another standard open-source license.
+
+The upstream authors retain their rights in their work. This source publication
+does not establish additional upstream redistribution, commercial-use, or
+sublicensing permissions. No blanket standard license is assigned to this
+combined repository. Clarification or additional permissions must come from
+the relevant rights holders. See THIRD_PARTY_NOTICES.md for file provenance.
+
+本仓库公开源码并保留上游声明；“公开源码”不等同于已获得标准开源协议授权。
+第三方 npm 依赖仍适用各自许可证，不因本文件而变更。
