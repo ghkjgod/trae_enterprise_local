@@ -47,3 +47,9 @@ DeepSeek V4.1 Flash（含 1017）在 Trae 中支持 `light / high / extra_high`�
 支持文本、多模态目录允许的图像、OpenAI/Anthropic 工具结构、多轮工具结果、推理内容、流式 usage、SSE UTF-8 分片和 JSON 工具参数分片。不能将 API 接受请求等同于对所有客户端扩展字段的完整支持。未启用模型不会通过改名变得可用。
 
 `DeepSeek-V4.1-Flash` 与 `DeepSeek-V4.1-Flash-1017` 请求上游完整响应，以规避流式输出尾部丢失。客户端仍可使用 `stream: true`，但内容会在上游完成后发送。完整响应中的工具调用按 ID 区分，即使上游 index 重复也保持为独立调用；其他模型的流式工具参数继续按 index 拼接。
+
+## 等待与取消
+
+默认上游请求总时限为 600000 毫秒（10 分钟），可用 `UPSTREAM_TIMEOUT_MS` 调整。流式响应等待期间默认每 15000 毫秒发送 `: keep-alive` 注释，间隔由 `SSE_HEARTBEAT_MS` 配置；注释不包含模型内容，也不延长总时限。使用 Node.js 原生 AbortController 和标准 SSE 注释，无新增依赖。协议依据：[SSE 心跳说明](https://html.spec.whatwg.org/multipage/server-sent-events.html#authoring-notes)。
+
+上游超时返回 `error.code=upstream_timeout`；响应尚未开始时 HTTP 状态为 504，流式响应已开始时通过 `event: error` 报告并结束。客户端断开会立即取消上游工作，日志记录 `client_disconnected`。不自动重放聊天请求，以免重复生成或触发重复工具调用。

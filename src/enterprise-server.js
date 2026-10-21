@@ -22,6 +22,13 @@ const KEY = process.env.API_KEY;
 const PORT = Number(process.env.PORT || 19900);
 if (!KEY || KEY.length < 32) throw new Error('A random API_KEY of at least 32 characters is required.');
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT must be an integer between 1 and 65535.');
+function durationSetting(name, fallback) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isInteger(value) || value < 1 || value > 2147483647) throw new Error(`${name} must be a positive timer duration in milliseconds.`);
+  return value;
+}
+const UPSTREAM_TIMEOUT_MS = durationSetting('UPSTREAM_TIMEOUT_MS', 600000);
+const SSE_HEARTBEAT_MS = durationSetting('SSE_HEARTBEAT_MS', 15000);
 
 function authInfo() {
   // Read each time so a login/refresh performed by Trae is picked up automatically.
@@ -221,8 +228,14 @@ async function handle(req, res, protocol) {
   res.setHeader('X-Trae-Reasoning-Effort', request.reasoning_effort_level || 'default');
   const stream = req.body.stream === true;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 120000);
-  res.on('close', () => { if (!res.writableEnded) controller.abort(); });
+  let abortReason;
+  const abort = reason => {
+    if (!controller.signal.aborted) { abortReason = reason; controller.abort(); }
+  };
+  const timeout = setTimeout(() => abort('upstream_timeout'), UPSTREAM_TIMEOUT_MS);
+  const onClose = () => { if (!res.writableEnded) abort('client_disconnected'); };
+  res.on('close', onClose);
+  if (res.destroyed) onClose();
   let started = false, text = '', reasoning = '', finish = null, tokenUsage = {}, calls = new Map();
   let blockIndex = -1, blockType = null;
   const writeEvent = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -248,6 +261,13 @@ async function handle(req, res, protocol) {
     }
     writeEvent('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: type === 'thinking' ? { type: 'thinking_delta', thinking: value } : { type: 'text_delta', text: value } });
   };
+  // Buffered DeepSeek responses can take minutes before producing any content.
+  // SSE comments keep the connection active without inventing model output.
+  const heartbeat = stream ? setInterval(() => {
+    if (res.destroyed || res.writableEnded || controller.signal.aborted || res.writableNeedDrain) return;
+    start();
+    res.write(': keep-alive\n\n');
+  }, SSE_HEARTBEAT_MS) : null;
   try {
     const auth = authInfo();
     const response = await fetch(auth.host + '/api/ide/v2/llm_raw_chat', {
@@ -298,21 +318,30 @@ async function handle(req, res, protocol) {
       res.end();
     } else if (protocol === 'anthropic') res.json({ id, type: 'message', role: 'assistant', model, content: [...(reasoning ? [{ type: 'thinking', thinking: reasoning }] : []), ...(text ? [{ type: 'text', text }] : []), ...toolBlocks], stop_reason: reason, stop_sequence: null, usage: u });
     else res.json({ id, object: 'chat.completion', created: Math.floor(begun / 1000), model, choices: [{ index: 0, message: { role: 'assistant', content: text || null, ...(reasoning ? { reasoning_content: reasoning } : {}), ...(toolBlocks.length ? { tool_calls: toolBlocks.map(t => ({ id: t.id, type: 'function', function: { name: t.name, arguments: JSON.stringify(t.input) } })) } : {}) }, finish_reason: toolBlocks.length ? 'tool_calls' : finish }], usage: { prompt_tokens: u.input_tokens, completion_tokens: u.output_tokens, total_tokens: u.input_tokens + u.output_tokens } });
-    console.log(JSON.stringify({ protocol, stream, model: actualModel, reasoning_effort_level: request.reasoning_effort_level || 'default', status: 'ok', tools: toolBlocks.length, duration_ms: Date.now() - begun }));
+    console.log(JSON.stringify({ timestamp: new Date().toISOString(), protocol, stream, model: actualModel, reasoning_effort_level: request.reasoning_effort_level || 'default', status: 'ok', tools: toolBlocks.length, duration_ms: Date.now() - begun }));
   } catch (e) {
-    const error = { type: 'error', error: { type: 'api_error', message: e.name === 'AbortError' ? 'Request cancelled or timed out' : e.message } };
+    const cancelled = controller.signal.aborted;
+    const code = cancelled ? abortReason : undefined;
+    const message = code === 'upstream_timeout' ? `Trae upstream response timed out after ${UPSTREAM_TIMEOUT_MS} ms`
+      : code === 'client_disconnected' ? 'Client disconnected; upstream request cancelled' : e.message;
+    const error = { type: 'error', error: { type: 'api_error', ...(code ? { code } : {}), message } };
     if (!res.destroyed) {
       if (started) { writeEvent('error', error); res.end(); }
-      else res.status(502).json(error);
+      else res.status(code === 'upstream_timeout' ? 504 : 502).json(error);
     }
-    console.error(JSON.stringify({ protocol, model: actualModel, reasoning_effort_level: request.reasoning_effort_level || 'default', upstream_stream: request.stream, status: 'error', message: error.error.message, duration_ms: Date.now() - begun }));
-  } finally { clearTimeout(timeout); controller.abort(); }
+    console.error(JSON.stringify({ timestamp: new Date().toISOString(), protocol, model: actualModel, reasoning_effort_level: request.reasoning_effort_level || 'default', upstream_stream: request.stream, status: code === 'client_disconnected' ? 'cancelled' : 'error', code, timeout_ms: UPSTREAM_TIMEOUT_MS, message: error.error.message, duration_ms: Date.now() - begun }));
+  } finally {
+    clearTimeout(timeout);
+    if (heartbeat) clearInterval(heartbeat);
+    res.off('close', onClose);
+    controller.abort();
+  }
 }
 
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '10mb' }));
-app.get('/health', (req, res) => res.json({ status: 'ok', adapter: 'zedex-trae-cn-enterprise', default_model: MODEL, cached_models: catalogCache?.models.length || 0 }));
+app.get('/health', (req, res) => res.json({ status: 'ok', adapter: 'zedex-trae-cn-enterprise', default_model: MODEL, cached_models: catalogCache?.models.length || 0, upstream_timeout_ms: UPSTREAM_TIMEOUT_MS, sse_heartbeat_ms: SSE_HEARTBEAT_MS }));
 app.use(authenticate);
 app.get('/v1/models', async (req, res) => {
   try {

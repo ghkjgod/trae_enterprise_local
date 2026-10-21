@@ -36,6 +36,8 @@ npm start
 
 如需国内 npm 镜像，可执行 `npm ci --registry=https://registry.npmmirror.com`。依赖锁文件保留完整性哈希。
 
+聊天请求默认最多等待上游 10 分钟，通过 `.env` 的 `UPSTREAM_TIMEOUT_MS=600000` 调整；流式客户端等待期间每 15 秒收到一次 SSE 注释心跳（`SSE_HEARTBEAT_MS=15000`），心跳不会显示为模型回复。两项均为正整数毫秒，修改后重启代理。客户端取消会立即取消上游请求；上游超时会明确报告 `upstream_timeout`，并与 `client_disconnected` 分开记录。
+
 检查监听：
 
 ```powershell
