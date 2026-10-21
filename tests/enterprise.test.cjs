@@ -70,3 +70,27 @@ test('Different models keep their own upstream variant, with no silent fallback'
   assert.equal(result.request.max_tokens, 16000);
   assert.throws(() => prepare({ ...body, model: 'minimax-m3' }, 'anthropic', catalog), /not enabled/);
 });
+
+test('Complete Trae calls with repeated index zero stay separate by ID', () => {
+  const calls = new Map();
+  addCalls(calls, [
+    { index: 0, id: 'first', function_call: { name: 'read', arguments: '{"path":"first.txt"}' } },
+    { index: 0, id: 'second', function_call: { name: 'read', arguments: '{"path":"second.txt"}' } }
+  ], { complete: true });
+  assert.equal(calls.size, 2);
+  assert.deepEqual([...calls.values()].map(c => ({ id: c.id, input: JSON.parse(c.arguments) })), [
+    { id: 'first', input: { path: 'first.txt' } },
+    { id: 'second', input: { path: 'second.txt' } }
+  ]);
+  // Repeating a complete snapshot must not append a second JSON document.
+  addCalls(calls, [{ index: 0, id: 'first', function_call: { name: 'read', arguments: '{"path":"first.txt"}' } }], { complete: true });
+  assert.equal(calls.size, 2);
+  assert.equal(JSON.parse(calls.get(0).arguments).path, 'first.txt');
+});
+
+test('Complete argument snapshots preserve escaping and do not concatenate calls', () => {
+  const calls = new Map();
+  const inputs = [{ path: 'C:\\测试\\first.txt', content: '中文\n"quoted"\\' }, { path: 'second.txt', content: 'another' }];
+  addCalls(calls, inputs.map((input, i) => ({ index: 0, id: 'call_' + i, function: { name: 'write', arguments: JSON.stringify(input) } })), { complete: true });
+  assert.deepEqual([...calls.values()].map(c => JSON.parse(c.arguments)), inputs);
+});

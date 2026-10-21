@@ -13,6 +13,9 @@ const { readReasoningCapabilities, chooseEffort } = require('./reasoning-effort'
 
 const MODEL = process.env.DEFAULT_MODEL || 'qwen3.8-max';
 const LEGACY_ALIASES = new Set(['claude-sonnet-5', 'claude-haiku-4-5-20251001']);
+// These upstream models can drop their final output with stream:true.
+// Request complete output while retaining client-facing SSE.
+const BUFFERED_UPSTREAM_MODELS = new Set(['DeepSeek-V4.1-Flash', 'DeepSeek-V4.1-Flash-1017']);
 const AUTH_DIR = process.env.TRAE_DATA_DIR || path.join(os.homedir(), 'AppData', 'Roaming', 'Trae CN');
 const STATE_DIR = path.join(__dirname, '..', 'data');
 const KEY = process.env.API_KEY;
@@ -38,8 +41,8 @@ let catalogCache = null, catalogPromise = null;
 function desktopAlias(id) { return id === MODEL ? 'claude-sonnet-5' : 'claude-sonnet-5-route-' + crypto.createHash('sha256').update(id).digest('hex').slice(0, 12); }
 // These chat_model catalog entries emitted reasoning_content in direct probes.
 const verifiedReasoningModels = new Set(['kimi-k2.8-preview', 'kimi-k2.7-code', 'DeepSeek-V4.1-Flash', 'DeepSeek-V4-Pro-Official', 'DeepSeek-V4-Flash-Official']);
-async function getCatalog() {
-  if (catalogCache && Date.now() - catalogCache.fetchedAt < 300000) return catalogCache;
+async function getCatalog(force = false) {
+  if (!force && catalogCache && Date.now() - catalogCache.fetchedAt < 300000) return catalogCache;
   if (catalogPromise) return catalogPromise;
   catalogPromise = (async () => {
     const auth = authInfo();
@@ -60,7 +63,7 @@ async function getCatalog() {
         reasoning_effort_options: effort?.options || [], default_reasoning_effort: effort?.default_level,
         effort_variants: (effort?.options || []).map(level => ({ id: entry.config_name + '@' + level, level, desktop_alias: desktopAlias(entry.config_name + '@' + level) })),
         desktop_alias: desktopAlias(entry.config_name), max_tokens: variant.max_tokens || 16000,
-        prompt_max_tokens: variant.prompt_max_tokens || 100000, multimodal: display.multimodal === true, reasoning: display.model_capability === 'reasoning_model' || verifiedReasoningModels.has(entry.config_name) });
+        prompt_max_tokens: variant.prompt_max_tokens || 100000, multimodal: display.multimodal === true, reasoning: display.model_capability === 'reasoning_model' || !!effort?.options?.length || verifiedReasoningModels.has(entry.config_name) });
     }
     if (!models.length) throw new Error('Trae returned no enabled models');
     catalogCache = { models, excluded, fetchedAt: Date.now() };
@@ -126,7 +129,7 @@ function prepare(body, protocol, catalog) {
   if (!selected) throw new Error(`Model is not enabled in the enterprise catalog: ${model}`);
   const messages = protocol === 'anthropic' ? anthropicMessages(body) : openaiMessages(body);
   const request = { model_name: selected.upstream_model, config_name: selected.id, user_input: '',
-    session_id: crypto.randomUUID(), conversation_id: crypto.randomUUID(), messages, stream: true };
+    session_id: crypto.randomUUID(), conversation_id: crypto.randomUUID(), messages, stream: !BUFFERED_UPSTREAM_MODELS.has(selected.id) };
   const requestedMax = body.max_completion_tokens ?? body.max_tokens;
   request.max_tokens = Number.isFinite(requestedMax) ? Math.max(1, Math.min(requestedMax, selected.max_tokens)) : selected.max_tokens;
   if (!selected.multimodal && messages.some(m => m.content?.some(p => p.type === 'image_url'))) throw new Error(`Image input is not enabled for ${selected.id} in the Trae enterprise catalog`);
@@ -176,14 +179,22 @@ async function* sseEvents(body) {
   const last = parse(); if (last) yield last;
 }
 
-function addCalls(calls, incoming) {
+function addCalls(calls, incoming, { complete = false } = {}) {
   for (const t of incoming || []) {
-    const index = t.index ?? calls.size;
+    // With upstream stream:false, Trae sends complete calls but can assign
+    // index:0 to every call. Their IDs, not these repeated indexes, identify
+    // separate operations. A repeated complete call replaces its snapshot.
+    const known = complete && t.id ? [...calls].find(([, call]) => call.id === t.id) : undefined;
+    const index = complete ? (known ? known[0] : calls.size) : (t.index ?? calls.size);
     let old = calls.get(index);
     if (!old) { old = { id: t.id || 'toolu_' + crypto.randomBytes(12).toString('hex'), name: '', arguments: '' }; calls.set(index, old); }
     if (t.id) old.id = t.id;
     const f = t.function_call || t.function || {};
     if (f.name) old.name = f.name;
+    if (complete) {
+      old.arguments = typeof f.arguments === 'string' ? f.arguments : (f.partial_arguments || '');
+      continue;
+    }
     // Enterprise output events carry deltas in arguments as well as partial_arguments.
     // Replacing this field discards earlier chunks of long tool calls.
     if (typeof f.arguments === 'string' && f.arguments) old.arguments += f.arguments;
@@ -252,7 +263,7 @@ async function handle(req, res, protocol) {
         const thought = d.reasoning_content || d.reasoning || '';
         if (thought) { reasoning += thought; emitContent('thinking', thought); }
         if (d.response) { text += d.response; emitContent('text', d.response); }
-        addCalls(calls, d.tool_calls);
+        addCalls(calls, d.tool_calls, { complete: !request.stream });
       } else if (evt.event === 'token_usage') tokenUsage = d;
       else if (evt.event === 'done') finish = d.finish_reason || 'stop';
     }
@@ -294,7 +305,7 @@ async function handle(req, res, protocol) {
       if (started) { writeEvent('error', error); res.end(); }
       else res.status(502).json(error);
     }
-    console.error(JSON.stringify({ protocol, status: 'error', message: error.error.message, duration_ms: Date.now() - begun }));
+    console.error(JSON.stringify({ protocol, model: actualModel, reasoning_effort_level: request.reasoning_effort_level || 'default', upstream_stream: request.stream, status: 'error', message: error.error.message, duration_ms: Date.now() - begun }));
   } finally { clearTimeout(timeout); controller.abort(); }
 }
 
@@ -305,7 +316,7 @@ app.get('/health', (req, res) => res.json({ status: 'ok', adapter: 'zedex-trae-c
 app.use(authenticate);
 app.get('/v1/models', async (req, res) => {
   try {
-    const catalog = await getCatalog();
+    const catalog = await getCatalog(req.query.refresh === 'true');
     res.json({ object: 'list', data: catalog.models.map(m => ({ ...m, object: 'model', created: 0, owned_by: 'trae-enterprise' })), excluded: catalog.excluded });
   } catch (e) { res.status(503).json({ error: e.message }); }
 });

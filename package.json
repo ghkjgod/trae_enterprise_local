@@ -13,6 +13,7 @@
     "dev": "node --watch src/enterprise-server.js",
     "test": "node --test tests/*.test.cjs",
     "export:clients": "node scripts/export-clients.cjs",
+    "sync:models": "node scripts/sync-opencode-models.cjs --force",
     "check:public": "node scripts/check-public-files.cjs"
   },
   "dependencies": { "dotenv": "^16.4.5", "express": "^4.21.0", "node-fetch": "^2.7.0" }
