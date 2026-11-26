@@ -9,6 +9,7 @@ const { StringDecoder } = require('string_decoder');
 const { decryptAuthData } = require('./trae-decrypt');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const { readReasoningCapabilities, chooseEffort } = require('./reasoning-effort');
 
 const MODEL = process.env.DEFAULT_MODEL || 'qwen3.8-max';
@@ -40,9 +41,33 @@ function authInfo() {
   return { token: a.token, host: host.origin, expires: a.expiredAt };
 }
 
+const TRAE_APP_ID = '7b3f9dc2-8a4e-5c6d-2f1b-9e4a3c5b7df0';
+const DEFAULT_TRAE_CLIENT_VERSION = process.env.TRAE_CLIENT_VERSION || '0.216.0';
+const DEFAULT_TRAE_VERSION_CODE = process.env.TRAE_CLIENT_VERSION_CODE || '20260908';
+
+// The enterprise catalog is version-gated. Prefer the official CLI cache when it
+// exists, so an official CLI upgrade is picked up without another adapter edit.
+function traeClientVersion() {
+  let version = process.env.TRAE_CLIENT_VERSION || '';
+  let versionCode = process.env.TRAE_CLIENT_VERSION_CODE || '';
+  if (!version || !versionCode) {
+    try {
+      const cache = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.trae', 'cli', 'models_cache.json'), 'utf8'));
+      const match = typeof cache.client_version === 'string' && cache.client_version.match(/^([^:]+):trae_tob:(\{.*\})$/);
+      if (match) {
+        const metadata = JSON.parse(match[2]);
+        if (!version && typeof match[1] === 'string' && match[1]) version = match[1];
+        if (!versionCode && metadata.version_code != null) versionCode = String(metadata.version_code);
+      }
+    } catch { /* The desktop-only setup may not have a CLI cache yet. */ }
+  }
+  return { version: version || DEFAULT_TRAE_CLIENT_VERSION, versionCode: versionCode || DEFAULT_TRAE_VERSION_CODE };
+}
+
 function upstreamHeaders(token) {
+  const client = traeClientVersion();
   return { 'Content-Type': 'application/json', Authorization: 'Cloud-IDE-JWT ' + token,
-    'X-App-Id': '7b3f9dc2-8a4e-5c6d-2f1b-9e4a3c5b7df0', 'X-IDE-Version-Code': '20260206', 'X-IDE-Version': '99.99.99', 'X-IDE-Function': 'chat' };
+    'X-App-Id': TRAE_APP_ID, 'X-IDE-Version-Code': client.versionCode, 'X-IDE-Version': client.version, 'X-IDE-Function': 'chat' };
 }
 let catalogCache = null, catalogPromise = null;
 function desktopAlias(id) { return id === MODEL ? 'claude-sonnet-5' : 'claude-sonnet-5-route-' + crypto.createHash('sha256').update(id).digest('hex').slice(0, 12); }
